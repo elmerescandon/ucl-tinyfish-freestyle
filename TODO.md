@@ -39,6 +39,33 @@ shelf prices, keeping the constraint "no official APIs" — options to evaluate
 - If a better source exists, patch `price_item()` in `bin/meals` behind the
   same interface (returns `{store: {price, unit}}`) — do not change the CLI.
 
+**Findings (bishop, 2026-10-05).** Probe results for `tuna in water` via
+plain `tinyfish fetch` vs `tinyfish agent run` (fetch = free; agent ≈ $0.11
+at 0.016/step):
+
+| Source | fetch | agent | Fetch latency | Notes |
+|---|---|---|---|---|
+| Waitrose search | ✅ full | not needed | 2–4s | names + shelf + unit price, reliable |
+| Iceland search | ✅ full | not needed | ~13s | names + prices + unit price; **not on trolley** |
+| Tesco search | 🚫 bot_blocked | ✅ 7 steps, 54s | — | accurate, per-call cost real ($) |
+| Asda search | 🚫 bot_blocked | untested | — | same class as Tesco |
+| Sainsbury's | 🚫 page_not_found | untested | — | SPA, no fetchable URL |
+| Morrisons | ✅ but query dropped | untested | — | names stripped, redirected to /categories |
+| Aldi | ✅ but always home | ⚠️ ran, 0 results | 3–43s | no indexed grocery pages; JS-only search |
+| Lidl | ✅ but redirects home | ⚠️ no priced search results | 37s+ | no per-item prices; **agent CAN read offer carousels** (`ods-price` on landing pages, e.g. /c/food-drink/s10068374) → future offer-feed source, not an item callback |
+
+Decision: trolley/aggregator probing found no better single source; the
+winning playbook is the **hybrid** — keep trolley as primary, add a
+**per-store straight-fetch callback** for Waitrose (thin on trolley) and
+Iceland (absent from trolley). Tesco reachable via agent is possible but
+slow+costly; leave for when coverage matters more than cost.
+
+**Implemented.** `price_item()` in `bin/meals` now: trolley first → for any
+missing fallback store, fetch its public search page and parse shelf+unit
+price (cheapest match per store). Same interface `{store: {price, unit}}`,
+CLI unchanged. Verified end-to-end: `tuna` and `salt` (previously 0-store
+items) now quote via fallback; JSON shape unchanged.
+
 ---
 
 ## T3 — Fix output presentation
