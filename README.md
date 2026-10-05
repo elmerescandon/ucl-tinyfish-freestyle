@@ -83,6 +83,34 @@ target, checked against the cheapest store's total.
 }
 ```
 
+## Recipe cache (`bin/recipes`)
+
+Recipes rarely change, so they are stored in a persistent, inspectable
+store at `data/recipes.json` (git-ignored; deleting it just empties the
+cache). Shared helpers live in `lib/common.py` and `lib/recipes_store.py`,
+used by both CLIs.
+
+Usage (`bin/recipes -h` prints it too):
+
+```
+bin/recipes cache '<dish>'   # find recipe + parse ingredients, store it (expensive: search+fetch)
+bin/recipes get '<dish>'     # print stored recipe as JSON (exit 1 if not cached)
+bin/recipes list             # list cached dishes (names, #ingredients, cached_at)
+bin/recipes rm '<dish>'      # delete one entry
+```
+
+`bin/meals` checks this store before searching, so once a dish is cached its
+recipe step is instant (no `tinyfish` calls):
+
+```bash
+./bin/recipes cache 'mashed potatoes with tuna'   # populate the cache
+./bin/meals 'mashed potatoes with tuna'           # → "recipe: cache hit (...)" on stderr
+./bin/meals 'mashed potatoes with tuna' --no-cache # ignore store, force re-search/re-fetch (also re-caches)
+```
+
+The stderr path line tells you which route was taken: `recipe: cache hit`
+vs `recipe: fetched`. Run `--no-cache` if a recipe is stale.
+
 ## Status
 
 Scope defined. Recipe search/parse pipeline first, then price scraping
