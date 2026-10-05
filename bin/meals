@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+"""meals - tiny meal planner that prices a dish's ingredients across UK supermarkets.
+
+Usage:
+  meals 'mashed potatoes with tuna' [--servings 2] [--json]
+
+Pipeline (only `tinyfish search` + `tinyfish fetch`, no APIs, no browser):
+  1. find a recipe for the dish          -> search
+  2. read the recipe page                -> fetch, extract ingredients
+  3. price each ingredient               -> search site:trolley.co.uk -> fetch product page
+  4. per-store totals + cheapest store
+"""
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+
+STORES = [
+    "Tesco", "Asda", "Sainsbury's", "Sainsburys", "Morrisons",
+    "Waitrose", "Aldi", "Lidl", "Ocado", "Iceland", "Co-op",
+]
+UNIT_RE = re.compile(
+    r"^(?P<q1>\d+\s+\d*[\/\d]*)?(?P<q2>[\d\/.½¼¾⅓⅔⅛⅜⅝⅞]+)?\s*"
+    r"(?P<u>ounces?|oz|pounds?|lbs?|cups?|tablespoons?|tbsp|teaspoons?|tsp|"
+    r"g|kg|ml|l|litre[s]?|cans?|tins?|packs?|pack|cloves?|sticks?|sheets?|slices?)?\s*(?P<rest>.+)$"
+)
+PREP_WORDS = re.compile(
+    r"\b(peeled|peel|chopped|finely|roughly|drained|divided|packed|"
+    r"cut into|plus more|for serving|for dipping|for garnish|to taste|deseeded|"
+    r"cubed|sliced|grated|ground|boiled|mashed|at room temp)\b"
+)
+LEAD_MEASURE = re.compile(
+    r"^(?:cans?|tins?|packs?|pack(?:et)?s?|ounces?|oz|cups?|tablespoons?|tbsp|"
+    r"teaspoons?|tsp|cloves?|sheets?|sticks?|slices?|large|small|medium)\s+"
+)
+HYPHEN_UNIT = re.compile(r"(\d)\s*-\s*(ounce|oz|pound|lb|gram|kg|ml|litre|cup|tablespoon|tbsp|teaspoon|tsp)s?\b")
+
+
+def _cut_prep_words(name):
+    matches = list(PREP_WORDS.finditer(name))
+    if not matches:
+        return name
+    m0 = matches[0]
+    if m0.start() > 0:
+        return name[: m0.start()]
+    if len(matches) > 1:
+        return name[m0.end(): matches[1].start()]
+    return name[m0.end():]
+
+
+def _strip_leading_measures(name):
+    for _ in range(4):
+        stripped = LEAD_MEASURE.sub("", name, count=1).strip()
+        if stripped == name:
+            break
+        name = stripped
+    return name
+
+
+def run(args, timeout=60):
+    try:
+        p = subprocess.run(
+            ["tinyfish"] + args, capture_output=True, text=True, timeout=timeout
+        )
+        return p.stdout or ""
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def search(q):
+    out = run(["search", "query", q, "--pretty"])
+    return re.findall(r"https?://\S+", out)
+
+
+def fetch_text(url):
+    # tiny disk cache (TTL 12h) so re-runs don't re-hit trolley/recipe pages
+    import hashlib, os, tempfile
+
+    cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    key = hashlib.md5(url.encode()).hexdigest()
+    path = os.path.join(cache_dir, key + ".txt")
+    if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < 12 * 3600:
+        with open(path) as f:
+            return f.read()
+
+    out = run(["fetch", "content", "get", "--format", "markdown", url])
+    try:
+        i = out.find('{"results"')
+        if i < 0:
+            return ""
+        # keep only the first JSON object on the line ( defensively drop stray suffixes )
+        depth = 0
+        end = len(out)
+        for j in range(i, len(out)):
+            if out[j] == "{":
+                depth += 1
+            elif out[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j + 1
+                    break
+        data = json.loads(out[i:end])
+        results = data.get("results", [])
+        text = results[0].get("text", "") if results else ""
+        if text:
+            with open(path, "w") as f:
+                f.write(text)
+        return text
+    except Exception:
+        return ""
+
+
+def find_recipe(dish):
+    for url in search(f"{dish} recipe")[:5]:
+        if any(k in url for k in ("recipe", "bbcgoodfood", "allrecipes", "jamieoliver", "seriouseats")):
+            text = fetch_text(url)
+            if extract_ingredients(text):
+                return url, extract_title(text) or dish, extract_ingredients(text)
+    return dish, dish, []
+
+
+def extract_title(text):
+    m = re.search(r"^# (.+)$", text, re.M)
+    return m.group(1).strip() if m else None
+
+
+def extract_ingredients(text):
+    lines = text.split("\n")
+    start = None
+    for i, l in enumerate(lines):
+        if re.match(r"^#{0,4}\s*\**ingredients\**\s*$", l.strip(), re.I):
+            start = i + 1
+            break
+    if start is None:
+        return []
+    items = []
+    for l in lines[start:]:
+        s = l.strip()
+        if re.match(r"^#", s):
+            break
+        s = re.sub(r"^[*\-•]\s*", "", s).replace("▢", " ").strip()
+        if not s or s.startswith("!"):
+            continue
+        if s.startswith("**"):  # prose explanantions, not quantities
+            continue
+        items.append(s)
+    # preference: keep lines that start with a quantity if any exist
+    with_qty = [i for i in items if UNIT_RE.match(i)]
+    return with_qty if with_qty else items
+
+
+LEAD_MEASURE = re.compile(
+    r"^(?:cans?|tins?|packs?|pack(?:et)?s?|ounces?|oz|cups?|tablespoons?|tbsp|"
+    r"teaspoons?|tsp|cloves?|sheets?|sticks?|slices?|large|small|medium)\s+"
+)
+
+
+def clean_item(line):
+    line = HYPHEN_UNIT.sub(r"\1 \2 ", line)
+    m = UNIT_RE.match(line)
+    if m:
+        qty = (m.group("q1") or m.group("q2") or "")
+        unit = (m.group("u") or "").lower()
+        name = m.group("rest").strip()
+    else:
+        qty, unit, name = "", "", line.strip()
+    name = _cut_prep_words(name)
+    name = _strip_leading_measures(name)
+    name = name.strip(" -,:")
+    return (name or line.strip(" -,:")), qty.strip(), unit
+
+
+def price_item(name):
+    urls = search(f"site:trolley.co.uk {name}")
+    trolley = next((u for u in urls if "trolley.co.uk/product/" in u), None)
+    if not trolley:
+        return {}
+    text = fetch_text(trolley)
+    return parse_store_prices(text)
+
+
+def parse_store_prices(text):
+    quotes = {}
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    for i, l in enumerate(lines):
+        store = next((s for s in STORES if l.lower().rstrip("'s") == s.lower().rstrip("'s")
+                      or l == s), None)
+        if not store:
+            continue
+        store = "Sainsbury's" if store in ("Sainsburys",) else store
+        for j in range(i + 1, min(i + 4, len(lines))):
+            pm = re.match(r"^£(\d+\.\d{1,2})$", lines[j])
+            if pm:
+                price = float(pm.group(1))
+                unit = lines[j + 1] if j + 1 < len(lines) and re.match(
+                    r"^£[\d.]+ per ", lines[j + 1]) else ""
+                cur = quotes.get(store)
+                if cur is None or price < cur["price"]:
+                    quotes[store] = {"price": price, "unit": unit}
+                break
+    return quotes
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="meals")
+    ap.add_argument("dish", nargs="+")
+    ap.add_argument("--servings", type=int, default=2)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+    dish = " ".join(args.dish)
+
+    print(f"→ finding a recipe for '{dish}'...", file=sys.stderr, flush=True)
+    url, title, ingredients = find_recipe(dish)
+    if not ingredients:
+        print(json.dumps({"error": "no recipe / ingredients found", "dish": dish}))
+        sys.exit(1)
+    print(f"  recipe: {title} ({url})", file=sys.stderr, flush=True)
+
+    items = []
+    for line in ingredients:
+        name, qty, unit = clean_item(line)
+        if len(name) < 2:
+            continue
+        items.append({"raw": line, "name": name, "qty": qty, "unit": unit})
+
+    print(f"→ pricing {len(items)} items across stores (in parallel)...", file=sys.stderr, flush=True)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(price_item, it["name"]): it for it in items}
+        for fut in as_completed(futs):
+            it = futs[fut]
+            it["quotes"] = fut.result()
+            n = len(it["quotes"])
+            print(f"  {it['name']:<32} {n} store(s)", file=sys.stderr, flush=True)
+
+    totals = defaultdict(float)
+    missing = []
+    for it in items:
+        if not it["quotes"]:
+            missing.append(it["name"])
+            continue
+        for store, q in it["quotes"].items():
+            totals[store] += q["price"]
+    ranked = sorted(totals.items(), key=lambda kv: kv[1])
+    cheapest = ranked[0][0] if ranked else None
+
+    out = {
+        "dish": dish,
+        "servings": args.servings,
+        "recipe": {"title": title, "url": url},
+        "shopping_list": [{k: it[k] for k in ("name", "qty", "unit")} for it in items],
+        "quotes": {it["name"]: it["quotes"] for it in items},
+        "totals_gbp": dict(ranked),
+        "cheapest": cheapest,
+        "not_priced": missing,
+    }
+    print(json.dumps(out, indent=2))
+
+    if not args.json:
+        print("\n=== WEEK BASKET ===", file=sys.stderr, flush=True)
+        for store, tot in ranked:
+            marker = " ← cheapest" if store == cheapest else ""
+            print(f"{store:<12} £{tot:.2f}{marker}", file=sys.stderr, flush=True)
+        if missing:
+            print(f"not priced: {', '.join(missing)}", file=sys.stderr, flush=True)
+
+
+if __name__ == "__main__":
+    main()
