@@ -12,6 +12,8 @@ servers, no frameworks. Reproduce current behavior with:
 
 ## T1 — Find price sources beyond trolley.co.uk
 
+**Owner.** Agent **bishop** — t1 in progress.
+
 **Problem.** We price items via `search site:trolley.co.uk <item>` → fetch the
 trolley product page → regex the per-store prices. Known issues:
 

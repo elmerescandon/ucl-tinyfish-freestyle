@@ -30,6 +30,9 @@ STORES = [
 ]
 
 
+FALLBACK_STORES = ("Waitrose", "Iceland")
+
+
 # thin wrappers over lib/common.py (helpers moved verbatim); keep names stable
 def run(args, timeout=60):
     return common.run(args, timeout)
@@ -59,13 +62,93 @@ def clean_item(line):
     return common.clean_item(line)
 
 
+def parse_waitrose(text):
+    """Text layout: '<name> in trolley.' / 'Item price' / '£x.xx' / 'Price per unit' / '£x.xx/kg'."""
+    quotes = {}
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    for i, l in enumerate(lines):
+        pm = re.match(r"^£(\d+\.\d{2})$", l)
+        if not pm:
+            continue
+        window = [x.lower() for x in lines[max(0, i - 2):i]]
+        if "item price" not in window:
+            continue
+        try:
+            idx = lines.index("Price per unit", i, i + 4)
+            unit = lines[idx + 1]
+        except (ValueError, IndexError):
+            unit = ""
+        price = float(pm.group(1))
+        if "Waitrose" not in quotes or price < quotes["Waitrose"]["price"]:
+            quotes["Waitrose"] = {"price": price, "unit": unit}
+    return quotes
+
+
+def parse_iceland(text):
+    """Text layout: '<name>\\n£3.50\\nWas£3.85\\n£6.63/1kg'."""
+    quotes = {}
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    for i, l in enumerate(lines):
+        pm = re.match(r"^£(\d+\.\d{2})$", l)
+        if not pm:
+            continue
+        if i + 1 >= len(lines) or not re.match(r"^£[\d.]+/", lines[i + 1]):
+            continue
+        price = float(pm.group(1))
+        if "Iceland" not in quotes or price < quotes["Iceland"]["price"]:
+            quotes["Iceland"] = {"price": price, "unit": lines[i + 1]}
+    return quotes
+
+
+def fallback_prices(name):
+    quotes = {}
+    enc = name.replace(" ", "%20")
+    jobs = [
+        ("Waitrose",
+         f"https://www.waitrose.com/ecom/shop/search?products=&searchTerm={enc}",
+         parse_waitrose),
+        ("Iceland", f"https://www.iceland.co.uk/search?q={enc}", parse_iceland),
+    ]
+    # dish-level context is not needed; pick the cheapest-defensible match
+    for store, url, parse in jobs:
+        try:
+            text = fetch_text(url)
+            got = parse(text)
+            if store in got:
+                quotes[store] = got[store]
+        except Exception:
+            continue
+    return quotes
+
+
 def price_item(name):
     urls = search(f"site:trolley.co.uk {name}")
     trolley = next((u for u in urls if "trolley.co.uk/product/" in u), None)
-    if not trolley:
-        return {}
-    text = fetch_text(trolley)
-    return parse_store_prices(text)
+    quotes = {}
+    if trolley:
+        quotes = parse_store_prices(fetch_text(trolley))
+    # fallback: price the missing stores directly (cheap fetch, no agent)
+    for store in FALLBACK_STORES:
+        if store not in quotes:
+            got = fallback_one(store, name)
+            if got:
+                quotes[store] = got
+    return quotes
+
+
+def fallback_one(store, name):
+    enc = name.replace(" ", "%20")
+    if store == "Waitrose":
+        url = f"https://www.waitrose.com/ecom/shop/search?products=&searchTerm={enc}"
+        parse = parse_waitrose
+    else:
+        url = f"https://www.iceland.co.uk/search?q={enc}"
+        parse = parse_iceland
+    try:
+        got = parse(fetch_text(url))
+        return got.get(store)
+    except Exception:
+        return None
 
 
 def parse_store_prices(text):
@@ -88,6 +171,82 @@ def parse_store_prices(text):
                     quotes[store] = {"price": price, "unit": unit}
                 break
     return quotes
+
+
+def _clip(s, w):
+    return s if len(s) <= w else s[: w - 3] + "..."
+
+
+def suggest(name):
+    if re.search(r"\b(tuna|salmon|sardines?|mackerel|herring|anchovies?)\b", name):
+        return f"try '{name} chunks in water'"
+    if re.search(
+        r"\b(potatoes?|onions?|carrots?|cabbage|spinach|tomatoes?|garlic|lemons?|apples?|salad)\b", name
+    ):
+        return f"try 'fresh {name}'"
+    if re.search(r"\b(salt|pepper|sugar|flour|yeast|panko|bread ?crumbs?|oil|vinegar|mustard)\b", name):
+        return f"try '{name}' (own-brand, dry-goods aisle)"
+    return f"try 'frozen {name}'"
+
+
+def human_summary(out, ranked, verdict):
+    items, quotes, cov = out["shopping_list"], out["quotes"], out["coverage"]
+    priced_n = len(items) - len(out["not_priced"])
+    stores = sorted(
+        {s for q in quotes.values() for s in q},
+        key=lambda s: (-cov.get(s, 0), out["totals_gbp"].get(s, 9e9), s),
+    )
+    name_w = min(30, max([len("item")] + [len(i["name"]) for i in items]))
+    col_w = {s: max(len(s), 6) + 2 for s in stores}
+    for s in stores:
+        units = [quotes[n][s].get("unit", "") for n in quotes if s in quotes[n]]
+        if units:
+            col_w[s] = max(col_w[s], max(len(u) for u in units) + 4)
+
+    lines = [
+        f"=== BASKET: {out['dish']} — {out['recipe']['title']} ===",
+        "",
+        "item".ljust(name_w + 2) + "".join(s.ljust(col_w[s]) for s in stores),
+        "-" * (name_w + 2 + sum(col_w.values())),
+    ]
+    for it in items:
+        q = quotes.get(it["name"], {})
+        cells, units = [], []
+        for s in stores:
+            if s in q:
+                cells.append(f"£{q[s]['price']:.2f}".ljust(col_w[s]))
+                units.append(
+                    _clip(f"({q[s]['unit']})", col_w[s]).ljust(col_w[s]) if q[s].get("unit") else " " * col_w[s]
+                )
+            else:
+                cells.append("—".ljust(col_w[s]))
+                units.append("".ljust(col_w[s]))
+        lines.append(it["name"][:name_w].ljust(name_w + 2) + "".join(cells))
+        if any(u.strip() for u in units):
+            lines.append("".ljust(name_w + 2) + "".join(units))
+    lines.append("")
+    lines.append(f"=== TOTALS ===  (ranked: priced >= {out['coverage_threshold']} of {priced_n} items)")
+    for s, tot, c in ranked:
+        mark = "   ← cheapest" if s == verdict else ""
+        lines.append(f"{s:<14} £{tot:>6.2f}   ({c}/{priced_n} items){mark}")
+    excluded = sorted(
+        (s for s in cov if cov[s] < out["coverage_threshold"]), key=lambda s: cov[s], reverse=True
+    )
+    for s in excluded:
+        lines.append(
+            f"{s:<14} £{out['totals_gbp'].get(s, 0):>6.2f}   ({cov[s]}/{priced_n} items)   "
+            "[excluded: below coverage threshold]"
+        )
+    if not ranked:
+        lines.append("  no store met the coverage threshold — nothing to compare")
+    if out["not_priced"]:
+        lines.append("")
+        lines.append(f"=== NOT PRICED ({len(out['not_priced'])}) ===")
+        for n in out["not_priced"]:
+            lines.append(f"  {n}   {suggest(n)}")
+    lines.append("")
+    lines.append(f"recipe: {out['recipe']['title']}  <{out['recipe']['url']}>")
+    return "\n".join(lines)
 
 
 def main():
@@ -122,7 +281,10 @@ def main():
             })
         print("recipe: fetched", file=sys.stderr, flush=True)
     if not ingredients:
-        print(json.dumps({"error": "no recipe / ingredients found", "dish": dish}))
+        if args.json:
+            print(json.dumps({"error": "no recipe / ingredients found", "dish": dish}))
+        else:
+            print(f"error: no recipe / ingredients found for '{dish}'", file=sys.stderr)
         sys.exit(1)
     print(f"  recipe: {title} ({url})", file=sys.stderr, flush=True)
 
@@ -142,16 +304,23 @@ def main():
             n = len(it["quotes"])
             print(f"  {it['name']:<32} {n} store(s)", file=sys.stderr, flush=True)
 
-    totals = defaultdict(float)
-    missing = []
-    for it in items:
-        if not it["quotes"]:
-            missing.append(it["name"])
-            continue
+    priced = [it for it in items if it["quotes"]]
+    missing = [it["name"] for it in items if not it["quotes"]]
+    cov, totals = defaultdict(int), defaultdict(float)
+    for it in priced:
         for store, q in it["quotes"].items():
             totals[store] += q["price"]
-    ranked = sorted(totals.items(), key=lambda kv: kv[1])
-    cheapest = ranked[0][0] if ranked else None
+            cov[store] += 1
+    # rank only stores that priced >= half of the priced items; comparing
+    # totals over different item subsets is what made the old verdict wrong
+    thresh = max(1, len(priced) // 2)
+    ranked = sorted(
+        ((s, totals[s], cov[s]) for s in totals if cov[s] >= thresh),
+        key=lambda r: (r[1], -r[2]),
+    )
+    # only call a store cheapest when another qualified store covered the
+    # same number of items — otherwise the two baskets are not comparable
+    verdict = ranked[0][0] if ranked and any(c == ranked[0][2] for _, _, c in ranked[1:]) else None
 
     out = {
         "dish": dish,
@@ -159,19 +328,16 @@ def main():
         "recipe": {"title": title, "url": url},
         "shopping_list": [{k: it[k] for k in ("name", "qty", "unit")} for it in items],
         "quotes": {it["name"]: it["quotes"] for it in items},
-        "totals_gbp": dict(ranked),
-        "cheapest": cheapest,
+        "totals_gbp": dict(totals),
+        "cheapest": verdict,
         "not_priced": missing,
+        "coverage": dict(cov),
+        "coverage_threshold": thresh,
     }
-    print(json.dumps(out, indent=2))
-
-    if not args.json:
-        print("\n=== WEEK BASKET ===", file=sys.stderr, flush=True)
-        for store, tot in ranked:
-            marker = " ← cheapest" if store == cheapest else ""
-            print(f"{store:<12} £{tot:.2f}{marker}", file=sys.stderr, flush=True)
-        if missing:
-            print(f"not priced: {', '.join(missing)}", file=sys.stderr, flush=True)
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return
+    print(human_summary(out, ranked, verdict), flush=True)
 
 
 if __name__ == "__main__":

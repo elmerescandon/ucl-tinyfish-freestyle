@@ -49,6 +49,17 @@ There's a small tool to browse and manage the saved recipes:
 If `meals` ever picks up a stale recipe, run it with `--no-cache` to
 re-fetch it fresh.
 
+## Output
+
+By default the human summary goes to stdout: a per-item × per-store price
+table (unit prices in parentheses), store totals with item counts
+(`Tesco £7.80 (3/11 items)`), and `not priced` items with a suggested
+next-step query. A store is only ranked if it priced at least half of the
+priced items, and `← cheapest` only appears when at least two ranked
+stores covered the same number of items — totals over different item
+subsets aren't comparable. Pass `--json` for the machine-readable dump
+(same shape, plus `coverage` and `coverage_threshold`).
+
 ## Supermarkets covered
 
 Tesco, Sainsbury's, Aldi, Lidl, Waitrose, and a couple of others that show
@@ -63,4 +74,5 @@ re-scrape everything.
 
 Recipe search, ingredient parsing, and pricing all work end-to-end. The
 meal-plan output is still simplified — one recipe is picked per dish, and
--cheapest logic is currently best-effort.
+-cheapest logic is coverage-aware but price sources are still
+trolley.co.uk-only.
