@@ -49,6 +49,41 @@ There's a small tool to browse and manage the saved recipes:
 If `meals` ever picks up a stale recipe, run it with `--no-cache` to
 re-fetch it fresh.
 
+## Weekly planner
+
+One dish per run is fine for tonight; for the week there's `bin/mealplan`.
+Give it several dishes and it plans them as one basket — shared ingredients
+are bought **once**:
+
+```bash
+./bin/mealplan 'fish pie' 'mashed potatoes with tuna' --budget 30
+```
+
+What you get:
+
+- Per-meal reference cost (what each dish would cost on its own), then
+  **one merged basket**: potatoes for the mash and potatoes for frying are a
+  single line with a combined quantity (`500 g + ½ pound → 727 g`), priced
+  once, marked `shared ×2 meals — feeds: <dish A>, <dish B>`.
+- Merging is deliberately conservative: same product only. `tomatoes` and
+  `chopped tomatoes` (a tin) stay separate; so do `potatoes` and `sweet
+  potatoes`. Variety/cut words do merge (`yukon gold potatoes` = `potatoes`,
+  `free-range eggs` = `eggs`), and units are converted where safe
+  (`½ pound` + `500 g`, `tbsp` + `ml`).
+- Per-store totals over the merged basket with the same coverage rule as
+  `meals` (a store is only ranked if it priced at least half the items), a
+  projected weekly total from the cheapest comparable store, and against
+  `--budget N`: `£31.58 of £30.00 — over by £1.58`.
+
+Machine-readable plan with `--json`: `dishes[]`, `merged_shopping_list[]`
+(each item: `name`, combined `qty`/`unit`, `used_in`, `shared`), `quotes`,
+`totals_gbp`, `cheapest`, `weekly_total_gbp`, `budget_gbp`, `under_budget`.
+
+Notes: `--servings` and `--no-cache` pass through to `meals` for every dish;
+a dish whose recipe can't be found is skipped with a warning and the plan
+covers the rest; re-runs reuse the recipe/price caches, so planning the same
+week twice is fast.
+
 ## Output
 
 By default the human summary goes to stdout: a per-item × per-store price

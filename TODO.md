@@ -50,7 +50,7 @@ at 0.016/step):
 | Tesco search | 🚫 bot_blocked | ✅ 7 steps, 54s | — | accurate, per-call cost real ($) |
 | Asda search | 🚫 bot_blocked | untested | — | same class as Tesco |
 | Sainsbury's | 🚫 page_not_found | untested | — | SPA, no fetchable URL |
-| Morrisons | ✅ but query dropped | untested | — | names stripped, redirected to /categories |
+| Morrisons | ✅ but query dropped | untested | ~3s | names stripped, redirected to /categories |
 | Aldi | ✅ but always home | ⚠️ ran, 0 results | 3–43s | no indexed grocery pages; JS-only search |
 | Lidl | ✅ but redirects home | ⚠️ no priced search results | 37s+ | no per-item prices; **agent CAN read offer carousels** (`ods-price` on landing pages, e.g. /c/food-drink/s10068374) → future offer-feed source, not an item callback |
 
@@ -100,7 +100,93 @@ table where the cheapest verdict is defensible from the table alone.
 
 ---
 
+## T4 — Weekly meal plan: several dishes, one basket, a budget
+
+**Owner.** Agent **rook** — t4 in progress.
+
+**Problem.** `bin/meals` prices exactly one dish per run. Planning a week
+means N separate runs, N separate baskets, and no idea what the week costs —
+and shared ingredients (oil, potatoes, salt) get priced and bought twice.
+
+**Task.** Add `bin/mealplan` (new file — `bin/meals` stays untouched; you
+consume it, you don't modify it):
+
+```bash
+./bin/mealplan 'fish pie' 'mashed potatoes with tuna' 'leek and potato soup' \
+  [--servings 2] [--budget 30] [--json]
+```
+
+1. Per dish: run `./bin/meals '<dish>' --json` as a subprocess (use
+   `lib.common.run`-style timeouts, one thread per dish) and treat its JSON
+   output as the input contract — do not re-implement recipe search or
+   pricing, and do not import from `bin/meals`. A dish that fails (exit 1 /
+   no recipe) degrades to a warning; the plan continues with the rest.
+2. Shared-ingredient reuse across meals (the point of the plan): canonicalise
+   names (fold singular/plural: `potato` → `potatoes`) and merge the same
+   base ingredient bought for different meals — potatoes for the mash and
+   potatoes for frying become **one combined line, priced once**, with
+   `feeds: dish A, dish B` so you can see what each purchase covers.
+   Quantities combine: same unit → sum (`olive oil 2 tbsp + 3 tbsp → 5 tbsp`);
+   different units → one line per unit, sharing the price quote.
+   Be conservative — merge only the same purchasable product: `tomatoes` ≠
+   `chopped tomatoes` (tin), `potatoes` ≠ `sweet potatoes`.
+3. One basket, priced once: per-store totals summed over the merged list,
+   reusing the quotes each `meals` run already returned (identical item
+   names across dishes = one item, one quote). Same coverage rule as
+   `bin/meals`: rank only stores that priced ≥ half of priced items;
+   `← cheapest` only when coverage ties.
+4. Weekly budget: with `--budget N` print the projected weekly total against
+   N for the cheapest comparable store, plus a per-meal cost table and
+   `£X.XX of £N.NN — under/over by £Y.YY`.
+5. `--json`: machine-readable plan shape, documented in README: `dishes[]`,
+   `merged_shopping_list[]` (each item: `name`, combined `qty`/`unit`,
+   `used_in: [dishes]`, `shared: bool`), `quotes`, `totals_gbp`, `cheapest`,
+   `weekly_total_gbp`, `budget_gbp`, `under_budget`.
+
+**Deliverable.** `bin/mealplan` working end-to-end; a "Weekly planner"
+section in README with a real example run and the `--json` shape.
+
+**Acceptance.**
+- `./bin/mealplan 'fish pie' 'mashed potatoes with tuna'` prints per-meal
+  costs, per-store totals over the merged basket, and a weekly total.
+- Two dishes that both use potatoes (e.g. a mash and a fried-potato dish)
+  produce a **single** `potatoes` line with combined quantity and
+  `feeds: <dish A>, <dish B>` — never two lines, never two prices. A marker
+  shows which merged items are shared (`shared × 2 meals`) so reuse is
+  visible at a glance.
+- `tomatoes` and `chopped tomatoes` in the same plan stay as separate lines
+  (different products), each priced separately.
+- `--budget N` gives an explicit under/over verdict.
+- Warm re-run reuses recipe cache hits (visible on stderr) and does not
+  re-scrape; cold-cache run (`rm -rf data/`) also succeeds.
+- `python3 -c "import ast; ast.parse(open('bin/mealplan').read())"` passes.
+- `bin/meals` untouched — knight owns it. If a change there seems needed,
+  report it instead of making it.
+
+**Scope.** Owns `bin/mealplan` (new), optionally `lib/plan_store.py` (new,
+only if you persist plans). Reads `lib/common.py` freely, but edits to it or
+to `bin/meals` are off-limits for this task.
+
+---
+
 ## Small fixups (fold into any of the above)
+
+- `--servings` is advertised in README as "scale for more people" but
+  `bin/meals` never scales quantities — they're parsed raw. Either scale by
+  `servings / servings_base` (recipes.json already stores the base) or fix
+  the README claim.
+- **UNIT_RE eats the `l` of words after a quantity** (found by t4): the unit
+  alternation matches a bare `l` (litre) inside the following word, so
+  `5 large potatoes` parses as qty=5, unit=`l`, name=`arge potatoes` (same
+  for `1 large handful` → `arge handful`). Add a word boundary / require the
+  rest to start on a word boundary after the unit. This directly hurts
+  `bin/mealplan` merging: `arge potatoes` can't be recognised as `potatoes`
+  (and 5 potatoes become "5 l").
+- `250 mil single cream 1 cup` → `mil` typo unrecognised, name becomes the
+  whole `mil single cream 1 cup`; prose tail (`or more if you prefer...`,
+  `leave out if you don't like them`, `I used 1 x 200gms packet of`) leaks
+  into names, which both blocks merging and yields 0-store prices. Trim the
+  name at ` or |leave out|optional|I used|– ` style separators.
 
 - Search fallback for generic ingredients: if `site:trolley.co.uk <name>`
   yields no product URL, retry once with `<name> in water|frozen|fresh` style

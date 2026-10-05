@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+"""mealplan - weekly meal planner: several dishes, one merged basket, a budget.
+
+Usage:
+  mealplan 'fish pie' 'mashed potatoes with tuna' [--servings 2] [--budget 30] [--json] [--no-cache]
+
+Pipeline (reuses bin/meals via its --json contract; no new scraping):
+  1. per dish  -> `bin/meals '<dish>' --json` (subprocess, one thread per dish)
+  2. merge     -> shared ingredients bought once: the same purchasable product
+                  across dishes becomes one line with a combined quantity,
+                  one price quote, and a `feeds:` list of the meals it covers
+  3. basket    -> per-store totals over the merged list, coverage-aware
+                  (same rule as bin/meals: rank only >= half of priced items)
+  4. budget    -> weekly total (cheapest comparable store) vs --budget
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MEALS = os.path.join(ROOT, "bin", "meals")
+MEALS_TIMEOUT = 300  # seconds per dish; meals does its own per-call timeouts
+
+# weight/volume -> base unit, so "½ pound potatoes" + "500 g potatoes" merge
+TO_BASE = {
+    "g": ("g", 1.0), "kg": ("g", 1000.0),
+    "pound": ("g", 454.0), "pounds": ("g", 454.0),
+    "lb": ("g", 454.0), "lbs": ("g", 454.0),
+    "ounce": ("g", 28.35), "ounces": ("g", 28.35), "oz": ("g", 28.35),
+    "ml": ("ml", 1.0), "l": ("ml", 1000.0),
+    "litre": ("ml", 1000.0), "litres": ("ml", 1000.0),
+    "cup": ("ml", 240.0), "cups": ("ml", 240.0),
+    "tablespoon": ("ml", 15.0), "tablespoons": ("ml", 15.0), "tbsp": ("ml", 15.0),
+    "teaspoon": ("ml", 5.0), "teaspoons": ("ml", 5.0), "tsp": ("ml", 5.0),
+}
+
+# words in the raw ingredient line that mark a DIFFERENT purchasable product:
+# "chopped tomatoes" (tin) is not "tomatoes", "sweet potatoes" is not "potatoes"
+FORM_WORDS = {
+    "chopped", "tinned", "canned", "smoked", "sweet", "pickled", "dried",
+    "baby", "salted", "unsalted", "roasted", "ground", "instant",
+    "red", "green", "brown", "black", "white",
+    "double", "single", "sour", "clotted", "whipping",
+    "olive", "sunflower", "vegetable", "rapeseed", "coconut",
+    "puree", "purée", "paste", "ketchup",
+}
+
+# words that only describe variety/cut/packaging — two items differing only
+# by these are the same purchase ("yukon gold potatoes" = "potatoes")
+QUALIFIER_WORDS = {
+    "yukon", "gold", "king", "edward", "maris", "piper", "desiree", "rooster",
+    "floury", "waxy", "baking", "new",
+    "chunk", "chunks", "breast", "breasts", "thigh", "thighs", "fillet", "fillets",
+    "in", "water", "brine", "spring", "own", "juice",
+    "fresh", "large", "small", "medium", "whole",
+    "free-range", "organic",
+    "flat", "leaf", "leaves", "wedge", "wedges",
+}
+
+FRACTIONS = {"¼": 0.25, "½": 0.5, "¾": 0.75, "⅓": 1 / 3, "⅔": 2 / 3,
+             "⅛": 0.125, "⅜": 0.375, "⅝": 0.625, "⅞": 0.875}
+
+
+# --- per-dish: reuse bin/meals through its documented --json contract -------
+
+def run_meals(dish, servings, no_cache):
+    cmd = [sys.executable, MEALS, dish, "--json", "--servings", str(servings)]
+    if no_cache:
+        cmd.append("--no-cache")
+    try:
+        # stderr is inherited so meals' live progress (incl. recipe cache hits)
+        # streams through; we only parse its stdout JSON
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, timeout=MEALS_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return None, f"timed out after {MEALS_TIMEOUT}s"
+    except FileNotFoundError:
+        return None, "bin/meals not found"
+    try:
+        out = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        return None, f"unparseable meals output: {p.stdout[:120]!r}"
+    if out.get("error"):
+        return None, out["error"]
+    if p.returncode != 0:
+        return None, f"meals exited {p.returncode}"
+    return out, None
+
+
+# --- merging: same purchasable product across dishes = bought once ----------
+
+def canonical_name(name):
+    n = re.sub(r"\s+", " ", name.strip().lower())
+    if n.endswith(("oes", "ses", "xes", "zes", "ches", "shes")):
+        n = n[:-2]
+    elif n.endswith("s") and not n.endswith(("ss", "us", "is")):
+        n = n[:-1]
+    return n
+
+
+def qty_to_float(q):
+    """'2' -> 2.0, '½' -> 0.5, '1 ½' -> 1.5, '1/2' -> 0.5; '2 5' -> None."""
+    q = (q or "").strip()
+    if not q:
+        return None
+    total, tokens = 0.0, q.split()
+    for i, t in enumerate(tokens):
+        if t in FRACTIONS:
+            total += FRACTIONS[t]
+            continue
+        if "/" in t:
+            a, _, b = t.partition("/")
+            try:
+                total += float(a) / float(b)
+            except (ValueError, ZeroDivisionError):
+                return None
+            continue
+        try:
+            v = float(t)
+        except ValueError:
+            return None
+        prev = tokens[i - 1] if i else ""
+        if i and prev not in FRACTIONS and "/" not in prev and "." not in prev:
+            return None  # '2 5' (from '2 5-ounce cans') is not a real number
+        total += v
+    return total
+
+
+def base_unit(unit):
+    """('pound'|'kg'|'oz'|...) -> (base unit, factor); 'cans' -> ('can', 1)."""
+    u = (unit or "").strip().lower()
+    if u in TO_BASE:
+        return TO_BASE[u]
+    if u.endswith("s"):
+        u = u[:-1]
+    return (u, 1.0)
+
+
+def form_set(raw):
+    words = re.sub(r"[^a-zà-ÿ\s-]", " ", (raw or "").lower()).split()
+    return frozenset(w for w in words if w in FORM_WORDS)
+
+
+def mergeable(a, b):
+    """Same purchasable product? Form words must match exactly, and names must
+    be equal or differ only by qualifier words (variety/cut/packaging)."""
+    if a["form"] != b["form"]:
+        return False
+    if a["canon"] == b["canon"]:
+        return True
+    short, long_ = (a, b) if len(a["canon"]) <= len(b["canon"]) else (b, a)
+    if re.search(rf"\b{re.escape(short['canon'])}\b", long_["canon"]):
+        delta = set(long_["words"]) - set(short["words"])
+        return delta <= QUALIFIER_WORDS
+    return False
+
+
+def display_name(members):
+    return min(members, key=lambda m: len(m["canon"]))["name"]
+
+
+def first_quotes(members):
+    for m in members:
+        if m["quotes"]:
+            return m["quotes"]
+    return {}
+
+
+def merge_shopping_lists(per_dish):
+    """per_dish: OrderedDict dish -> meals JSON. Returns merged items."""
+    groups = []
+    for dish, out in per_dish.items():
+        for it in out.get("shopping_list", []):
+            name = it.get("name", "")
+            if not name:
+                continue
+            raw = it.get("raw") or name
+            canon = canonical_name(name)
+            base, factor = base_unit(it.get("unit") or "")
+            qty = qty_to_float(it.get("qty") or "")
+            entry = {
+                "dish": dish,
+                "name": name,
+                "canon": canon,
+                "words": set(canon.split()),
+                "form": form_set(raw),
+                "qty_raw": (it.get("qty") or "").strip(),
+                "unit": (it.get("unit") or "").strip(),
+                "base": base,
+                "base_value": qty * factor if qty is not None else None,
+                "quotes": out.get("quotes", {}).get(name) or {},
+            }
+            for g in groups:
+                if mergeable(g["rep"], entry):
+                    g["members"].append(entry)
+                    break
+            else:
+                groups.append({"rep": entry, "members": [entry]})
+
+    merged = []
+    for g in groups:
+        by_base = OrderedDict()
+        for m in g["members"]:
+            by_base.setdefault(m["base"], []).append(m)
+        for base, ms in by_base.items():
+            used_in = list(OrderedDict.fromkeys(m["dish"] for m in ms))
+            parseable = [m for m in ms if m["base_value"] is not None]
+            if not parseable:
+                # nothing measurable ("salt", "lemon wedges") -> one line, no qty
+                merged.append({"name": display_name(ms), "qty": "", "unit": "",
+                               "used_in": used_in, "shared": len(used_in) >= 2,
+                               "quotes": first_quotes(ms)})
+            elif len(parseable) == len(ms):
+                total = sum(m["base_value"] for m in ms)
+                merged.append({"name": display_name(ms), "qty": format_qty(total),
+                               "unit": base, "used_in": used_in,
+                               "shared": len(used_in) >= 2,
+                               "quotes": first_quotes(ms)})
+            else:
+                # mixed parseable/unparseable (e.g. '2 5' cans) -> keep apart
+                for m in ms:
+                    merged.append({"name": m["name"], "qty": m["qty_raw"],
+                                   "unit": m["unit"], "used_in": [m["dish"]],
+                                   "shared": False, "quotes": m["quotes"]})
+    return merged
+
+
+def format_qty(v):
+    if abs(v - round(v)) < 0.05:
+        return str(int(round(v)))
+    return f"{v:.2f}".rstrip("0").rstrip(".")
+
+
+def suggest(name):
+    # kept in sync with bin/meals (importing it is off-limits for this task)
+    if re.search(r"\b(tuna|salmon|sardines?|mackerel|herring|anchovies?)\b", name):
+        return f"try '{name} chunks in water'"
+    if re.search(r"\b(potatoes?|onions?|carrots?|cabbage|spinach|tomatoes?|garlic|lemons?|apples?|salad)\b", name):
+        return f"try 'fresh {name}'"
+    if re.search(r"\b(salt|pepper|sugar|flour|yeast|panko|bread ?crumbs?|oil|vinegar|mustard)\b", name):
+        return f"try '{name}' (own-brand, dry-goods aisle)"
+    return f"try 'frozen {name}'"
+
+
+# --- basket: totals + coverage-aware ranking (same rule as bin/meals) -------
+
+def rank_basket(merged):
+    priced = [m for m in merged if m["quotes"]]
+    totals, cov = defaultdict(float), defaultdict(int)
+    for m in priced:
+        for store, q in m["quotes"].items():
+            totals[store] += q["price"]
+            cov[store] += 1
+    thresh = max(1, len(priced) // 2)
+    ranked = sorted(
+        ((s, totals[s], cov[s]) for s in totals if cov[s] >= thresh),
+        key=lambda r: (r[1], -r[2]),
+    )
+    # only call a store cheapest when another ranked store covered the same
+    # number of items — otherwise the two baskets are not comparable
+    verdict = ranked[0][0] if ranked and any(c == ranked[0][2] for _, _, c in ranked[1:]) else None
+    return dict(totals), dict(cov), thresh, ranked, verdict
+
+
+def reference_basket(dish_out):
+    """Per-meal reference cost from the dish's own meals run (informational:
+    the weekly total prices shared items once, this does not)."""
+    totals = dish_out.get("totals_gbp", {})
+    cov = dish_out.get("coverage", {})
+    thresh = dish_out.get("coverage_threshold", 1)
+    ranked = sorted(
+        ((s, t, cov.get(s, 0)) for s, t in totals.items() if cov.get(s, 0) >= thresh),
+        key=lambda r: (r[1], -r[2]),
+    )
+    return ranked[0] if ranked else None
+
+
+# --- output ------------------------------------------------------------------
+
+def _clip(s, w):
+    return s if len(s) <= w else s[: w - 3] + "..."
+
+
+def human_summary(out, items):
+    cov, thresh = out["coverage"], out["coverage_threshold"]
+    totals = out["totals_gbp"]
+    priced_n = len(items) - len(out["not_priced"])
+    stores = sorted(
+        {s for m in items for s in m["quotes"]},
+        key=lambda s: (-cov.get(s, 0), totals.get(s, 9e9), s),
+    )
+    name_w = min(34, max([len("item")] + [len(i["name"]) for i in items])) + 2
+    col_w = {s: max(len(s), 6) + 2 for s in stores}
+    for s in stores:
+        units = [m["quotes"][s].get("unit", "") for m in items if s in m["quotes"]]
+        if units:
+            col_w[s] = max(col_w[s], max(len(u) for u in units) + 4)
+
+    lines = [
+        f"=== WEEKLY PLAN: {len(out['dishes'])} meals "
+        f"({out['servings']} servings each) ===",
+        "",
+    ]
+    for i, d in enumerate(out["dishes"], 1):
+        ref = d.get("reference")
+        if ref:
+            ref_s = f"   reference: £{ref[1]:.2f} @ {ref[0]} ({ref[2]}/{d['priced_n']} items)"
+        else:
+            ref_s = "   reference: not priced"
+        lines.append(f"{i}. {d['dish']} — {d['recipe']['title']}")
+        lines.append(f"   {d['recipe']['url']}{ref_s}")
+    lines.append("")
+    lines.append("=== ONE BASKET — shared items bought once ===")
+    lines.append("")
+    lines.append("item".ljust(name_w + 2) + "".join(s.ljust(col_w[s]) for s in stores))
+    lines.append("-" * (name_w + 2 + sum(col_w.values())))
+    for m in items:
+        q = m["quotes"]
+        cells, units = [], []
+        for s in stores:
+            if s in q:
+                cells.append(f"£{q[s]['price']:.2f}".ljust(col_w[s]))
+                u = q[s].get("unit", "")
+                units.append(_clip(f"({u})", col_w[s]).ljust(col_w[s]) if u else " " * col_w[s])
+            else:
+                cells.append("—".ljust(col_w[s]))
+                units.append("".ljust(col_w[s]))
+        lines.append(m["name"][:name_w].ljust(name_w + 2) + "".join(cells))
+        second = f"need {m['qty']} {m['unit']}".strip() if m["qty"] or m["unit"] else ""
+        if any(u.strip() for u in units):
+            lines.append(f"  {second}".ljust(name_w + 2) + "".join(units))
+        elif second:
+            lines.append(f"  {second}")
+        if m["shared"]:
+            lines.append(f"  shared ×{len(m['used_in'])} meals — feeds: {', '.join(m['used_in'])}")
+    lines.append("")
+    lines.append(f"=== TOTALS ===  (ranked: priced >= {thresh} of {priced_n} items)")
+    for s, tot, c in out["ranked"]:
+        mark = "   ← cheapest" if s == out["cheapest"] else ""
+        lines.append(f"{s:<14} £{tot:>6.2f}   ({c}/{priced_n} items){mark}")
+    if not out["ranked"]:
+        lines.append("  no store met the coverage threshold — nothing to compare")
+    if out["weekly_total_gbp"] is not None:
+        lines.append("")
+        lines.append(f"weekly total: £{out['weekly_total_gbp']:.2f}  "
+                     f"(projected from {out['weekly_store']}, shared items priced once)")
+    if out["not_priced"]:
+        lines.append("")
+        lines.append(f"=== NOT PRICED ({len(out['not_priced'])}) ===")
+        for n in out["not_priced"]:
+            lines.append(f"  {n}   {suggest(n)}")
+    if out["budget_gbp"] is not None:
+        lines.append("")
+        lines.append("=== BUDGET ===")
+        if out["weekly_total_gbp"] is None:
+            lines.append("  weekly total unavailable — cannot check budget "
+                         "(insufficient store coverage)")
+        else:
+            wt, b = out["weekly_total_gbp"], out["budget_gbp"]
+            word = "under" if out["under_budget"] else "over"
+            lines.append(f"  £{wt:.2f} of £{b:.2f} — {word} by £{abs(b - wt):.2f}")
+    return "\n".join(lines)
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="mealplan")
+    ap.add_argument("dishes", nargs="+")
+    ap.add_argument("--servings", type=int, default=2)
+    ap.add_argument("--budget", type=str, default=None, help="weekly budget in £ (e.g. 30 or £30)")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--no-cache", action="store_true", help="force meals to re-fetch recipes/prices")
+    args = ap.parse_args()
+
+    budget = None
+    if args.budget:
+        try:
+            budget = float(args.budget.strip().lstrip("£"))
+        except ValueError:
+            ap.error(f"--budget must be a number, got {args.budget!r}")
+
+    print(f"→ planning {len(args.dishes)} dishes ({args.servings} servings each)...",
+          file=sys.stderr, flush=True)
+    results, failures = OrderedDict(), OrderedDict()
+    with ThreadPoolExecutor(max_workers=min(3, len(args.dishes))) as ex:
+        futs = {ex.submit(run_meals, d, args.servings, args.no_cache): d for d in args.dishes}
+        for fut in as_completed(futs):
+            d = futs[fut]
+            out, err = fut.result()
+            if out is None:
+                failures[d] = err
+                print(f"  ✗ {d}: {err}", file=sys.stderr, flush=True)
+            else:
+                results[d] = out
+                print(f"  ✓ {d}: {len(out.get('shopping_list', []))} items",
+                      file=sys.stderr, flush=True)
+    if not results:
+        msg = f"no dish could be planned: {failures or 'no dishes given'}"
+        if args.json:
+            print(json.dumps({"error": msg, "failures": dict(failures)}))
+        else:
+            print(f"error: {msg}", file=sys.stderr)
+        sys.exit(1)
+    for d, err in failures.items():
+        print(f"warning: skipped '{d}' ({err}) — plan covers the rest",
+              file=sys.stderr, flush=True)
+
+    per_dish = OrderedDict((d, results[d]) for d in args.dishes if d in results)
+    merged = merge_shopping_lists(per_dish)
+    totals, cov, thresh, ranked, verdict = rank_basket(merged)
+    weekly_total = ranked[0][1] if ranked else None
+    weekly_store = ranked[0][0] if ranked else None
+    not_priced = [m["name"] for m in merged if not m["quotes"]]
+
+    dishes = []
+    for d, out in per_dish.items():
+        ref = reference_basket(out)
+        dishes.append({
+            "dish": d,
+            "servings": args.servings,
+            "recipe": out.get("recipe", {}),
+            "totals_gbp": out.get("totals_gbp", {}),
+            "cheapest": out.get("cheapest"),
+            "not_priced": out.get("not_priced", []),
+            "priced_n": len(out.get("shopping_list", [])) - len(out.get("not_priced", [])),
+            "reference": list(ref) if ref else None,
+        })
+
+    out = {
+        "dishes": dishes,
+        "servings": args.servings,
+        "merged_shopping_list": [
+            {k: m[k] for k in ("name", "qty", "unit", "used_in", "shared")}
+            for m in merged
+        ],
+        "quotes": {m["name"]: m["quotes"] for m in merged},
+        "totals_gbp": totals,
+        "cheapest": verdict,
+        "not_priced": not_priced,
+        "coverage": cov,
+        "coverage_threshold": thresh,
+        "ranked": [[s, t, c] for s, t, c in ranked],
+        "weekly_total_gbp": weekly_total,
+        "weekly_store": weekly_store,
+        "budget_gbp": budget,
+        "under_budget": None if budget is None or weekly_total is None
+                        else weekly_total <= budget,
+    }
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return
+    print(human_summary(out, merged), flush=True)
+
+
+if __name__ == "__main__":
+    main()
