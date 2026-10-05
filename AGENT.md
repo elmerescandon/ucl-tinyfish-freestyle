@@ -1,7 +1,15 @@
 # AGENT.md — guidelines for agents working on TODO.md
 
-You are one of several agents working **in parallel**, one task per tab.
 Read `README.md`, `TODO.md` and skim `bin/meals` before doing anything.
+You will work directly on `main` (no feature branches, no PRs).
+
+## Claim a name (required)
+
+Before touching any code, pick a unique agent name (chess pieces are the
+convention) and write it into `TODO.md` on the task you claim, in the same
+style as "**Owner.** Agent **bishop** — t2 in progress". One agent = one
+task; a task already owned by another agent is off-limits. Use that name in
+commits (`git -c user.name='<name>' ...`) and in your final report.
 
 ## Ground rules (non-negotiable)
 
@@ -19,37 +27,22 @@ Read `README.md`, `TODO.md` and skim `bin/meals` before doing anything.
   the JSON output shape in README are contracts. Other tasks depend on them.
   Extend, don't break.
 
-## Isolation rules (you are NOT alone)
+## Ownership map (task per file scope)
 
-One task per branch. Work only inside your task's file scope:
+Work only inside your task's file scope:
 
-| Task | Branch | Owns | May touch |
-|------|--------|------|-----------|
-| T1 price sources | `todo/t1-price-sources` | `price_item()`, search fallbacks | `bin/meals` (pricing section only) |
-| T2 recipe cache | `todo/t2-recipe-cache` | `bin/recipes` (new), `lib/common.py` (new) | `bin/meals` (recipe-discovery section only) |
-| T3 output fix | `todo/t3-output` | reporting/`main()` in `bin/meals` | stdout/stderr layout only |
+| Task | Owns | May touch |
+|------|------|-----------|
+| T1 price sources | `price_item()`, search fallbacks | `bin/meals` (pricing section only) |
+| T2 recipe cache | `bin/recipes` (new), `lib/common.py` (new) | `bin/meals` (recipe-discovery section only) |
+| T3 output fix | reporting/`main()` in `bin/meals` | stdout/stderr layout only |
 
-- If T2 needs helpers that live in `bin/meals`, **move** them into
+- If you need helpers that live in `bin/meals`, **move** them into
   `lib/common.py` and import — but move only what you need, verbatim, and
-  leave thin wrappers in `bin/meals` so T1/T3 keep working. Do not reformat
-  or "improve" code you don't own.
+  leave thin wrappers in `bin/meals` so other tasks keep working. Do not
+  reformat or "improve" code you don't own.
 - Never rename functions, flags, or JSON keys that appear in README.
-- If two tasks must touch the same lines, coordinate through small commits:
-  keep each commit scoped to your section so git can merge cleanly.
-
-## Git workflow
-
-```bash
-git checkout main && git pull
-git checkout -b todo/t<N>-<slug>          # one branch per task
-# ... work in small commits: "t1: try basketr for tuna" not "wip"
-git push -u origin todo/t<N>-<slug>       # push early, push often
-```
-
-- Do **not** merge to `main` yourself; open a PR when the acceptance criteria
-  in TODO.md pass. PR title = task ID + short summary.
-- Rebase onto `main` at the start of your session; if `main` moved mid-task,
-  rebase again before the PR.
+- Keep commits scoped to your section.
 
 ## Verification before you claim done
 
@@ -61,12 +54,11 @@ python3 -c "import ast; ast.parse(open('bin/meals').read())"   # parses
 - Run the end-to-end at least once with a **cold cache**
   (`rm -rf data/`) and once warm. Both must succeed.
 - Each TODO task lists its own acceptance criteria — that is the bar. If you
-  cannot meet it, say so in the PR description instead of faking it.
+  cannot meet it, say so honestly instead of faking it.
 - Network is real: expect occasional tinyfish failures. Retry once, then
   degrade gracefully (empty quotes + `not_priced`), never crash.
 
 ## Report back
 
-In the PR description: what you tried (sources/prompts/regexes), what failed,
-latency numbers if relevant, and any follow-ups for TODO.md. Keep it short —
-facts, not narrative.
+Keep it short — facts, not narrative: what you tried, what failed, latency
+numbers if relevant, and any follow-ups for TODO.md.

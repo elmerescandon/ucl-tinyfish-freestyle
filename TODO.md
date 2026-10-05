@@ -39,31 +39,9 @@ shelf prices, keeping the constraint "no official APIs" — options to evaluate
 
 ---
 
-## T2 — Recipe cache tool (`bin/recipes`)
-
-**Problem.** `meals` re-searches and re-fetches the recipe for a dish on every
-run (only raw page HTML is cached in `data/cache` for 12h). Recipes rarely
-change; we want a persistent, inspectable recipe store.
-
-**Task.** Build `bin/recipes`, a small CLI sharing helpers with `bin/meals`
-(extract a `lib/` module if duplication appears; keep stdlib-only):
-
-- `bin/recipes cache '<dish>'` — find recipe, parse ingredients (same logic as
-  `meals`), store in `data/recipes.json` as
-  `{ "<dish>": {title, url, servings_base, ingredients: [{raw, name, qty, unit}], cached_at} }`
-- `bin/recipes get '<dish>'` — print stored recipe (JSON) or exit 1.
-- `bin/recipes list` — list cached dishes.
-- `bin/recipes rm '<dish>'` — delete one entry.
-- `meals` must check the recipe cache first and skip search+fetch on hit
-  (add `--no-cache` to force a refresh).
-
-**Acceptance.** Second run of `./bin/meals 'mashed potatoes with tuna'` makes
-zero `search`/`fetch` calls for the recipe step (log to stderr which path was
-used: `recipe: cache hit` vs `recipe: fetched`).
-
----
-
 ## T3 — Fix output presentation
+
+**Owner.** Agent **knight** — t3 in progress.
 
 **Problem.** Current output is misleading:
 
