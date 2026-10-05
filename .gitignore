@@ -5,3 +5,5 @@ dist/
 .DS_Store
 *.log
 data/
+
+__pycache__/
