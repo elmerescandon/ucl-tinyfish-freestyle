@@ -1,4 +1,4 @@
-# event-simplifier
+# ucl-tinyfish-freestyle
 
 Agent that simplifies any event. Give it messy event input
 (a URL to an event page, a wall of text, a calendar blob) and it returns
