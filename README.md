@@ -7,7 +7,7 @@ which store is cheapest.
 ## Quick start
 
 ```bash
-./bin/meals 'mashed potatoes with tuna'
+meals 'mashed potatoes with tuna'
 ```
 
 That's it. You'll get the recipe, the shopping list, and a price comparison
@@ -23,8 +23,8 @@ not priced: salt, black pepper
 A couple of useful flags:
 
 ```bash
-./bin/meals 'mashed potatoes with tuna' --servings 4   # scale for more people
-./bin/meals 'mashed potatoes with tuna' --json        # machine-readable output
+meals 'mashed potatoes with tuna' --servings 4   # scale for more people
+meals 'mashed potatoes with tuna' --json        # machine-readable output
 ```
 
 ## Recipe cache
@@ -33,17 +33,17 @@ Recipes don't change often, so after the first run they're saved on disk.
 The next time you ask for the same dish, the recipe lookup is instant:
 
 ```bash
-./bin/meals 'mashed potatoes with tuna'   # first run: recipe: fetched
-./bin/meals 'mashed potatoes with tuna'   # next run: recipe: cache hit (much faster)
+meals 'mashed potatoes with tuna'   # first run: recipe: fetched
+meals 'mashed potatoes with tuna'   # next run: recipe: cache hit (much faster)
 ```
 
 There's a small tool to browse and manage the saved recipes:
 
 ```bash
-./bin/recipes list                          # what's saved so far
-./bin/recipes get 'mashed potatoes with tuna'  # see the full stored recipe
-./bin/recipes rm 'mashed potatoes with tuna'   # forget it
-./bin/recipes cache 'fish pie'              # save a recipe in advance
+recipes list                          # what's saved so far
+recipes get 'mashed potatoes with tuna'  # see the full stored recipe
+recipes rm 'mashed potatoes with tuna'   # forget it
+recipes cache 'fish pie'              # save a recipe in advance
 ```
 
 If `meals` ever picks up a stale recipe, run it with `--no-cache` to
@@ -51,12 +51,12 @@ re-fetch it fresh.
 
 ## Weekly planner
 
-One dish per run is fine for tonight; for the week there's `bin/mealplan`.
+One dish per run is fine for tonight; for the week there's `mealplan`.
 Give it several dishes and it plans them as one basket — shared ingredients
 are bought **once**:
 
 ```bash
-./bin/mealplan 'fish pie' 'mashed potatoes with tuna' --budget 30
+mealplan 'fish pie' 'mashed potatoes with tuna' --budget 30
 ```
 
 What you get:

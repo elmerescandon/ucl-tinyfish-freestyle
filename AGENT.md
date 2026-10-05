@@ -42,13 +42,32 @@ continue without tinyfish. Note that a tinyfish binary that vanishes mid-run
 degrades silently (empty fetches → `not_priced` rows) — if you see mass
 empties, re-run the preflight.
 
+## Put the CLIs on your PATH
+
+The executables in `bin/` are meant to be used bare — `meals`, `recipes`,
+`mealplan` — not as `./bin/meals`. Add this repo's `bin/` to your PATH once:
+
+```bash
+# ~/.zshrc (or ~/.bashrc)
+export PATH="$PATH:/Users/raulescandon/Projects/ucl-tinyfish-freestyle/bin"
+```
+
+Then reload (`source ~/.zshrc`) and run from anywhere:
+
+```bash
+meals 'mashed potatoes with tuna'
+```
+
+Prefer a symlink over PATH? `ln -s "$PWD/bin/meals" /usr/local/bin/meals`
+(repeat for `recipes` and `mealplan`).
+
 ## Running it
 
 ```bash
-./bin/meals 'mashed potatoes with tuna'            # human summary on stdout
-./bin/meals 'fish pie' --json                      # machine-readable contract
-./bin/meals 'fish pie' --servings 4                # scale for more people
-./bin/meals 'fish pie' --no-cache                  # force a fresh recipe lookup
+meals 'mashed potatoes with tuna'            # human summary on stdout
+meals 'fish pie' --json                      # machine-readable contract
+meals 'fish pie' --servings 4                # scale for more people
+meals 'fish pie' --no-cache                  # force a fresh recipe lookup
 ```
 
 Split output discipline: stderr carries progress (`recipe: cache hit`,
